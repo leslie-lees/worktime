@@ -286,8 +286,44 @@ async function commitRecords(mutator, message){
   }
 }
 
-async function putFile(path, blob, message){
-  await api(`/contents/${path}`, {method:'PUT', body: JSON.stringify({message, content: await blobToB64(blob)})});
+const STALL_MS = 20000; // 上传中超过这么久没有任何进度，判定为卡住并中止
+
+function xhrPutContent(path, content, message, onProgress){
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', `https://api.github.com/repos/${cfg.repo}/contents/${path}`);
+    xhr.setRequestHeader('Authorization', `Bearer ${cfg.token}`);
+    xhr.setRequestHeader('Accept', 'application/vnd.github+json');
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    let stallTimer, stalled = false;
+    const resetStall = () => {
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => { stalled = true; xhr.abort(); }, STALL_MS);
+    };
+    xhr.upload.onloadstart = resetStall;
+    xhr.upload.onprogress = ev => {
+      resetStall();
+      if(ev.lengthComputable && onProgress) onProgress(ev.loaded / ev.total);
+    };
+    xhr.onload = () => {
+      clearTimeout(stallTimer);
+      if(xhr.status >= 200 && xhr.status < 300){ try{ resolve(JSON.parse(xhr.responseText)); }catch{ resolve(null); } }
+      else{
+        let msg = xhr.statusText || `HTTP ${xhr.status}`;
+        try{ msg = JSON.parse(xhr.responseText).message || msg; }catch{}
+        reject(new ApiError(xhr.status, msg));
+      }
+    };
+    xhr.onerror = () => { clearTimeout(stallTimer); reject(new Error('网络异常，上传失败')); };
+    xhr.onabort = () => { clearTimeout(stallTimer); reject(new Error(stalled ? '网络太慢，上传卡住已中止，请重试' : '上传已取消')); };
+    resetStall();
+    xhr.send(JSON.stringify({message, content}));
+  });
+}
+
+async function putFile(path, blob, message, onProgress){
+  const content = await blobToB64(blob);
+  await xhrPutContent(path, content, message, onProgress);
 }
 async function deleteFile(path){
   try{
@@ -530,41 +566,68 @@ function refreshPreview(){
   const pv = $('#prev'); if(pv) pv.innerHTML = previewLine();
 }
 
+async function commitImageMetas(oldDate, newDate, metas, removed, timeFields){
+  await commitRecords(rs => {
+    const cur = rs[oldDate] || {};
+    const keep = (cur.imgs || []).filter(i => !removed.has(i.path));
+    const tf = timeFields || {in: cur.in || '', out: cur.out || '', leave: !!cur.leave};
+    const rec = {in: tf.in, out: tf.out, leave: tf.leave, imgs: keep.concat(metas)};
+    if(newDate !== oldDate && rs[oldDate]) delete rs[oldDate];
+    const prev = rs[newDate];
+    if(newDate !== oldDate && prev) rec.imgs = (prev.imgs || []).concat(rec.imgs);
+    if(rec.in || rec.out || rec.leave || rec.imgs.length) rs[newDate] = rec; else delete rs[newDate];
+  }, `record ${newDate}`);
+}
+
 async function saveEditing(){
   const e = editing, btn = $('#btnSave');
   e.in = $('#fIn').value; e.out = $('#fOut').value;
   const newDate = $('#fDate').value || e.date;
+  const oldDate = e.date, removed = e.removed;
   btn.disabled = true;
+  const metas = [];
   try{
-    const metas = [];
     for(let k = 0; k < e.staged.length; k++){
-      btn.textContent = `上传中 ${k+1}/${e.staged.length}`;
       const f = e.staged[k].file;
       const ts = Date.now() + k;
       const ext = ((f.name.split('.').pop() || '').toLowerCase().replace(/[^a-z0-9]/g, '')) || (f.type.split('/')[1] || 'jpg');
       const path = `images/${newDate}/${ts}.${ext}`;
-      await putFile(path, f, `upload ${path}`);
+      const label = () => `上传中 ${k+1}/${e.staged.length}`;
+      btn.textContent = label() + ' · 0%';
+      try{
+        await putFile(path, f, `upload ${path}`, frac => { btn.textContent = `${label()} · ${Math.round(frac*100)}%`; });
+      }catch(upErr){
+        throw new Error(`第 ${k+1} 张截图上传失败（${upErr.message}）`);
+      }
       const meta = {path, name: f.name || `${ts}.${ext}`, size: f.size, type: f.type || MIME[ext] || '', ts};
       const th = await makeThumb(f);
-      if(th){ meta.thumb = `thumbs/${newDate}/${ts}.jpg`; await putFile(meta.thumb, th, `thumb ${meta.thumb}`); }
+      if(th){
+        try{ await putFile(meta.thumb = `thumbs/${newDate}/${ts}.jpg`, th, `thumb ${meta.thumb}`); }
+        catch{ delete meta.thumb; } // 缩略图失败不影响原图，查看时会直接用原图兜底
+      }
       metas.push(meta);
     }
     btn.textContent = '保存中…';
-    const removed = e.removed, oldDate = e.date;
-    await commitRecords(rs => {
-      const cur = rs[oldDate] || {};
-      const keep = (cur.imgs || []).filter(i => !removed.has(i.path));
-      const rec = {in: e.in, out: e.out, leave: e.leave, imgs: keep.concat(metas)};
-      if(newDate !== oldDate && rs[oldDate]) delete rs[oldDate];
-      const prev = rs[newDate];
-      if(newDate !== oldDate && prev) rec.imgs = (prev.imgs || []).concat(rec.imgs);
-      if(rec.in || rec.out || rec.leave || rec.imgs.length) rs[newDate] = rec; else delete rs[newDate];
-    }, `record ${newDate}`);
+    await commitImageMetas(oldDate, newDate, metas, removed, {in: e.in, out: e.out, leave: e.leave});
     for(const i of e.imgs) if(removed.has(i.path)){ deleteFile(i.path); if(i.thumb) deleteFile(i.thumb); }
     closeSheet(); render(); toast('已保存并同步到云端');
   }catch(err){
+    if(metas.length){
+      try{
+        await commitImageMetas(oldDate, oldDate, metas, removed);
+        const done = metas.length;
+        e.staged.splice(0, done).forEach(s => URL.revokeObjectURL(s.url));
+        e.imgs = e.imgs.filter(i => !removed.has(i.path)).concat(metas);
+        e.removed = new Set();
+        toast(`已上传 ${done} 张，${err.message}，可重新点保存重试剩余部分`);
+      }catch{
+        toast('保存失败：' + err.message);
+      }
+    } else {
+      toast('保存失败：' + err.message);
+    }
     btn.disabled = false; btn.textContent = '保存';
-    toast('保存失败：' + err.message);
+    if(editing === e) renderSheet();
   }
 }
 
