@@ -332,6 +332,76 @@ async function deleteFile(path){
   }catch{}
 }
 
+/* ---------- 截图自动识别打卡时间（OCR，尽力而为，识别后仍可手动修改） ---------- */
+let tesseractLoad;
+function loadTesseract(){
+  if(window.Tesseract) return Promise.resolve(window.Tesseract);
+  if(tesseractLoad) return tesseractLoad;
+  tesseractLoad = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+    s.onload = () => resolve(window.Tesseract);
+    s.onerror = () => reject(new Error('OCR 库加载失败'));
+    document.head.appendChild(s);
+  });
+  return tesseractLoad;
+}
+
+let ocrWorkerLoad;
+function getOcrWorker(){
+  if(!ocrWorkerLoad){
+    ocrWorkerLoad = loadTesseract().then(async Tesseract => {
+      const worker = await Tesseract.createWorker('eng');
+      await worker.setParameters({tessedit_char_whitelist: '0123456789:'});
+      return worker;
+    });
+  }
+  return ocrWorkerLoad;
+}
+
+// 截图里可能同时有历史记录的旧时间（字号较小）和当前的打卡时间，
+// 取识别到的候选里字号（框高）最大的一个，更接近实际打卡时刻；
+// 注意：某些 App 把打卡时间做成彩色圆圈里的艺术字，免费 OCR 经常读不出来，
+// 这种情况会退而识别到别的时间，因此识别结果务必让用户核对。
+async function ocrTime(file){
+  try{
+    const worker = await getOcrWorker();
+    const {data} = await worker.recognize(file);
+    const isTime = s => /^([01]?\d|2[0-3]):[0-5]\d$/.test(s);
+    const norm = s => { const [h, m] = s.split(':'); return `${h.padStart(2,'0')}:${m}`; };
+    let cands = [];
+    for(const w of (data.words || [])){
+      const t = (w.text || '').trim();
+      if(isTime(t)) cands.push({t: norm(t), h: w.bbox ? (w.bbox.y1 - w.bbox.y0) : 0});
+    }
+    if(!cands.length){
+      const found = (data.text || '').match(/([01]?\d|2[0-3]):[0-5]\d/g) || [];
+      cands = found.map(t => ({t: norm(t), h: 0}));
+    }
+    if(!cands.length) return null;
+    cands.sort((a, b) => b.h - a.h);
+    return cands[0].t;
+  }catch{ return null; }
+}
+
+function recognizeStaged(cur, s){
+  ocrTime(s.file).then(t => {
+    s.ocr = 'done';
+    if(editing !== cur) return;
+    if(!t){
+      if(s.slot) toast('未能从截图中识别到时间，请手动填写');
+      renderSheet();
+      return;
+    }
+    cur.in = $('#fIn') ? $('#fIn').value : cur.in;
+    cur.out = $('#fOut') ? $('#fOut').value : cur.out;
+    if(s.slot === 'in' && !cur.in){ cur.in = t; toast(`识别到时间 ${t} → 已填入上班，识别可能不准，请核对`); }
+    else if(s.slot === 'out' && !cur.out){ cur.out = t; toast(`识别到时间 ${t} → 已填入下班，识别可能不准，请核对`); }
+    else toast(`识别到截图时间 ${t}（未自动填入，可手动填写）`);
+    renderSheet();
+  });
+}
+
 async function makeThumb(file){
   try{
     const bmp = await createImageBitmap(file);
@@ -535,10 +605,10 @@ function renderSheet(){
       <div class="field"><label>下班打卡</label><input type="time" id="fOut" value="${esc(e.out)}"></div>
     </div>
     <div class="preview" id="prev">${previewLine()}</div>
-    <div class="field"><label>打卡截图（原图上传，可随时下载）</label>
+    <div class="field"><label>打卡截图（原图上传，会尝试自动识别时间，识别可能不准，请务必核对）</label>
       <div class="imgs" id="imgs">
         ${shown.map(i => `<div class="im" data-act="view" data-path="${esc(i.path)}"><img data-thumb="${esc(i.thumb || '')}" data-type="${esc(i.type || '')}" alt=""><span class="ph">加载中</span></div>`).join('')}
-        ${e.staged.map((s, k) => `<div class="im" data-act="unstage" data-k="${k}"><img src="${s.url}" alt=""><span class="tag">待上传 ✕</span></div>`).join('')}
+        ${e.staged.map((s, k) => `<div class="im" data-act="unstage" data-k="${k}"><img src="${s.url}" alt=""><span class="tag">${s.ocr === 'pending' ? '识别中…' : '待上传 ✕'}</span></div>`).join('')}
         <div class="im add" data-act="pick">＋</div>
       </div>
       <input type="file" id="fFile" accept="image/*" multiple hidden>
@@ -766,8 +836,20 @@ document.addEventListener('click', e => {
 
 document.addEventListener('change', e => {
   if(e.target.id === 'fFile'){
-    for(const f of e.target.files) editing.staged.push({file: f, url: URL.createObjectURL(f)});
-    editing.in = $('#fIn').value; editing.out = $('#fOut').value;
+    const files = [...e.target.files];
+    const cur = editing;
+    cur.in = $('#fIn').value; cur.out = $('#fOut').value;
+    let simIn = !!cur.in, simOut = !!cur.out;
+    for(const f of files){
+      let slot = null;
+      if(!cur.leave){
+        if(!simIn){ slot = 'in'; simIn = true; }
+        else if(!simOut){ slot = 'out'; simOut = true; }
+      }
+      const s = {file: f, url: URL.createObjectURL(f), ocr: 'pending', slot};
+      cur.staged.push(s);
+      recognizeStaged(cur, s);
+    }
     renderSheet();
   } else if(e.target.id === 'fDate' && editing){
     const nd = e.target.value; if(!nd) return;
