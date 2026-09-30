@@ -822,9 +822,7 @@ function monthDays(){
     if(key > today) continue;
     const dow = parseYmd(key).getDay();
     const weekend = dow === 0 || dow === 6;
-    const has = records[key] && (records[key].in || records[key].out || records[key].leave || records[key].imgs?.length);
-    if(weekend && !has) continue;
-    out.push({key, dow, weekend, has});
+    out.push({key, dow, weekend});
   }
   return out;
 }
@@ -857,7 +855,6 @@ function render(){
       <div class="nav"><button data-act="prev">‹</button><span>${y}年${+m}月</span><button data-act="next">›</button></div>
       <div class="tools">
         <button class="chip" data-act="bulkPick">批量导入</button>
-        <button class="chip" data-act="edit" data-date="${ymd(new Date())}" data-pick="1">补记</button>
       </div>
     </div>` + renderSummary() + renderList();
 }
