@@ -337,13 +337,21 @@ let tesseractLoad;
 function loadTesseract(){
   if(window.Tesseract) return Promise.resolve(window.Tesseract);
   if(tesseractLoad) return tesseractLoad;
+  const urls = [
+    'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+    'https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js'
+  ];
   tesseractLoad = new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
-    s.onload = () => resolve(window.Tesseract);
-    s.onerror = () => reject(new Error('OCR 库加载失败'));
-    document.head.appendChild(s);
-  });
+    const load = i => {
+      if(i >= urls.length){ reject(new Error('OCR 库加载失败')); return; }
+      const s = document.createElement('script');
+      s.src = urls[i];
+      s.onload = () => window.Tesseract ? resolve(window.Tesseract) : load(i + 1);
+      s.onerror = () => { s.remove(); load(i + 1); };
+      document.head.appendChild(s);
+    };
+    load(0);
+  }).catch(err => { tesseractLoad = null; throw err; });
   return tesseractLoad;
 }
 
@@ -352,54 +360,168 @@ function getOcrWorker(){
   if(!ocrWorkerLoad){
     ocrWorkerLoad = loadTesseract().then(async Tesseract => {
       const worker = await Tesseract.createWorker('eng');
-      await worker.setParameters({tessedit_char_whitelist: '0123456789:'});
+      await worker.setParameters({
+        tessedit_char_whitelist: '0123456789:：.;',
+        tessedit_pageseg_mode: '11', // sparse text：打卡截图里的时间通常散落在不同卡片中
+        preserve_interword_spaces: '1'
+      });
       return worker;
-    });
+    }).catch(err => { ocrWorkerLoad = null; throw err; });
   }
   return ocrWorkerLoad;
 }
 
-// 截图里可能同时有历史记录的旧时间（字号较小）和当前的打卡时间，
-// 取识别到的候选里字号（框高）最大的一个，更接近实际打卡时刻；
-// 注意：某些 App 把打卡时间做成彩色圆圈里的艺术字，免费 OCR 经常读不出来，
-// 这种情况会退而识别到别的时间，因此识别结果务必让用户核对。
-async function ocrTime(file){
+const OCR_MAX_SIDE = 1800;
+const normalizeOcrTime = raw => {
+  const s = String(raw || '').replace(/[Oo]/g, '0').replace(/[Il|]/g, '1');
+  const m = s.match(/(?:^|\D)([01]?\d|2[0-3])\s*[:：.;]\s*([0-5]\d)(?!\d)/);
+  return m ? `${m[1].padStart(2,'0')}:${m[2]}` : null;
+};
+
+async function decodeOcrImage(file){
+  if(window.createImageBitmap){
+    try{ return await createImageBitmap(file); }catch{}
+  }
+  const url = URL.createObjectURL(file);
+  try{
+    const img = new Image();
+    img.decoding = 'async';
+    img.src = url;
+    if(img.decode) await img.decode();
+    else await new Promise((ok, no) => { img.onload = ok; img.onerror = no; });
+    return img;
+  }catch(err){
+    URL.revokeObjectURL(url);
+    throw err;
+  }
+}
+
+// 同一张画布左侧保留原图，右侧把近白色像素转成黑色、其他像素转成白色。
+// 后者专门处理“橙色圆形按钮里的白色时间”，一次 OCR 即可兼顾普通黑字和反白字。
+async function makeOcrCanvas(file){
+  const bmp = await decodeOcrImage(file);
+  const iw = bmp.width || bmp.naturalWidth, ih = bmp.height || bmp.naturalHeight;
+  const scale = Math.min(1, OCR_MAX_SIDE / Math.max(iw, ih));
+  const w = Math.max(1, Math.round(iw * scale));
+  const h = Math.max(1, Math.round(ih * scale));
+  const src = document.createElement('canvas');
+  src.width = w; src.height = h;
+  const sx = src.getContext('2d', {willReadFrequently:true});
+  sx.drawImage(bmp, 0, 0, w, h);
+  if(bmp.close) bmp.close();
+  else if(bmp.src?.startsWith('blob:')) URL.revokeObjectURL(bmp.src);
+
+  const out = document.createElement('canvas');
+  out.width = w * 2; out.height = h;
+  const ox = out.getContext('2d');
+  ox.drawImage(src, 0, 0);
+  const img = sx.getImageData(0, 0, w, h), px = img.data;
+  for(let i = 0; i < px.length; i += 4){
+    const light = px[i] * .299 + px[i+1] * .587 + px[i+2] * .114;
+    const v = light > 215 ? 0 : 255;
+    px[i] = px[i+1] = px[i+2] = v;
+    px[i+3] = 255;
+  }
+  sx.putImageData(img, 0, 0);
+  ox.drawImage(src, w, 0);
+  return {canvas: out, originalWidth: w, height: h};
+}
+
+function collectOcrCandidates(data, originalWidth, imageHeight){
+  const out = [];
+  const add = (text, bbox, confidence = 0) => {
+    const t = normalizeOcrTime(text);
+    if(!t) return;
+    const b = bbox || {};
+    const x0 = Number(b.x0 || 0), x1 = Number(b.x1 || 0);
+    const y0 = Number(b.y0 || 0), y1 = Number(b.y1 || 0);
+    const h = Math.max(0, y1 - y0);
+    // 状态栏里的系统时间通常位于最顶部，只有找不到其他候选时才参与选择。
+    const statusBar = imageHeight && y1 < imageHeight * .08;
+    out.push({time:t, h, confidence:Number(confidence || 0), statusBar,
+      variant: x0 >= originalWidth ? 'light-text' : 'original'});
+  };
+
+  for(const w of (data.words || [])) add(w.text, w.bbox, w.confidence);
+  // 某些 Tesseract.js 版本不再直接返回 data.words，改为 blocks 嵌套结构。
+  for(const block of (data.blocks || []))
+    for(const para of (block.paragraphs || []))
+      for(const line of (para.lines || [])){
+        add(line.text, line.bbox, line.confidence);
+        for(const w of (line.words || [])) add(w.text, w.bbox, w.confidence);
+      }
+  if(!out.length){
+    const re = /([01]?\d|2[0-3])\s*[:：.;]\s*([0-5]\d)/g;
+    for(const m of String(data.text || '').matchAll(re)) add(m[0], null, 0);
+  }
+
+  const unique = new Map();
+  for(const c of out){
+    const prev = unique.get(c.time);
+    const score = c.h * 10 + c.confidence - (c.statusBar ? 10000 : 0);
+    const prevScore = prev ? prev.h * 10 + prev.confidence - (prev.statusBar ? 10000 : 0) : -Infinity;
+    if(score > prevScore) unique.set(c.time, c);
+  }
+  return [...unique.values()].sort((a, b) =>
+    (b.statusBar ? 0 : 1) - (a.statusBar ? 0 : 1) || b.h - a.h || b.confidence - a.confidence);
+}
+
+// 返回主时间及全部候选。字号最大的非状态栏时间通常就是圆形打卡按钮上的当前时间。
+async function ocrTimes(file){
   try{
     const worker = await getOcrWorker();
-    const {data} = await worker.recognize(file);
-    const isTime = s => /^([01]?\d|2[0-3]):[0-5]\d$/.test(s);
-    const norm = s => { const [h, m] = s.split(':'); return `${h.padStart(2,'0')}:${m}`; };
-    let cands = [];
-    for(const w of (data.words || [])){
-      const t = (w.text || '').trim();
-      if(isTime(t)) cands.push({t: norm(t), h: w.bbox ? (w.bbox.y1 - w.bbox.y0) : 0});
-    }
-    if(!cands.length){
-      const found = (data.text || '').match(/([01]?\d|2[0-3]):[0-5]\d/g) || [];
-      cands = found.map(t => ({t: norm(t), h: 0}));
-    }
-    if(!cands.length) return null;
-    cands.sort((a, b) => b.h - a.h);
-    return cands[0].t;
-  }catch{ return null; }
+    const prep = await makeOcrCanvas(file);
+    const {data} = await worker.recognize(prep.canvas, {}, {blocks:true, text:true});
+    const candidates = collectOcrCandidates(data, prep.originalWidth, prep.height);
+    return {primary: candidates[0]?.time || null, candidates};
+  }catch(err){
+    console.warn('OCR failed', err);
+    return {primary:null, candidates:[]};
+  }
+}
+
+function applyRecognizedTimes(cur, result){
+  const primary = result.primary;
+  if(!primary || cur.leave) return [];
+  const changed = [];
+  const minutes = t => { const [h,m] = t.split(':').map(Number); return h*60+m; };
+  const all = [...new Set(result.candidates.map(c => c.time))];
+  const primaryMin = minutes(primary);
+
+  // 一张下班截图常同时包含当天上班时间：若表单全空，顺便补上最早的上午时间。
+  if(!cur.in && !cur.out && primaryMin >= 12*60){
+    const morning = all.filter(t => minutes(t) < 12*60).sort((a,b) => minutes(a)-minutes(b))[0];
+    if(morning){ cur.in = morning; changed.push(`上班 ${morning}`); }
+    cur.out = primary; changed.push(`下班 ${primary}`);
+  } else if(!cur.in && primaryMin < 12*60){
+    cur.in = primary; changed.push(`上班 ${primary}`);
+  } else if(!cur.out && (!cur.in || primaryMin > minutes(cur.in))){
+    cur.out = primary; changed.push(`下班 ${primary}`);
+  } else if(!cur.in && cur.out && primaryMin < minutes(cur.out)){
+    cur.in = primary; changed.push(`上班 ${primary}`);
+  }
+  return changed;
 }
 
 function recognizeStaged(cur, s){
-  ocrTime(s.file).then(t => {
+  s.ocrPromise = ocrTimes(s.file).then(result => {
     s.ocr = 'done';
+    s.ocrResult = result;
     if(editing !== cur) return;
-    if(!t){
-      if(s.slot) toast('未能从截图中识别到时间，请手动填写');
-      renderSheet();
+    if(!result.primary){
+      toast('未能从截图中识别到时间，请手动填写');
+      if(!cur.saving) renderSheet();
       return;
     }
-    cur.in = $('#fIn') ? $('#fIn').value : cur.in;
-    cur.out = $('#fOut') ? $('#fOut').value : cur.out;
-    if(s.slot === 'in' && !cur.in){ cur.in = t; toast(`识别到时间 ${t} → 已填入上班，识别可能不准，请核对`); }
-    else if(s.slot === 'out' && !cur.out){ cur.out = t; toast(`识别到时间 ${t} → 已填入下班，识别可能不准，请核对`); }
-    else toast(`识别到截图时间 ${t}（未自动填入，可手动填写）`);
-    renderSheet();
+    if(!cur.saving){
+      cur.in = $('#fIn') ? $('#fIn').value : cur.in;
+      cur.out = $('#fOut') ? $('#fOut').value : cur.out;
+    }
+    const changed = applyRecognizedTimes(cur, result);
+    toast(changed.length ? `已识别并填入：${changed.join('、')}，请核对` : `识别到 ${result.primary}，现有时间未覆盖`);
+    if(!cur.saving) renderSheet();
   });
+  return s.ocrPromise;
 }
 
 async function makeThumb(file){
@@ -650,13 +772,21 @@ async function commitImageMetas(oldDate, newDate, metas, removed, timeFields){
 }
 
 async function saveEditing(){
-  const e = editing, btn = $('#btnSave');
+  const e = editing;
   e.in = $('#fIn').value; e.out = $('#fOut').value;
   const newDate = $('#fDate').value || e.date;
   const oldDate = e.date, removed = e.removed;
+  e.saving = true;
+  let btn = $('#btnSave');
   btn.disabled = true;
   const metas = [];
   try{
+    const pendingOcr = e.staged.map(s => s.ocrPromise).filter(Boolean);
+    if(pendingOcr.length){
+      btn.textContent = '识别图片中…';
+      await Promise.all(pendingOcr);
+      if(editing !== e) return;
+    }
     for(let k = 0; k < e.staged.length; k++){
       const f = e.staged[k].file;
       const ts = Date.now() + k;
@@ -696,7 +826,9 @@ async function saveEditing(){
     } else {
       toast('保存失败：' + err.message);
     }
-    btn.disabled = false; btn.textContent = '保存';
+    e.saving = false;
+    btn = $('#btnSave');
+    if(btn){ btn.disabled = false; btn.textContent = '保存'; }
     if(editing === e) renderSheet();
   }
 }
@@ -839,14 +971,8 @@ document.addEventListener('change', e => {
     const files = [...e.target.files];
     const cur = editing;
     cur.in = $('#fIn').value; cur.out = $('#fOut').value;
-    let simIn = !!cur.in, simOut = !!cur.out;
     for(const f of files){
-      let slot = null;
-      if(!cur.leave){
-        if(!simIn){ slot = 'in'; simIn = true; }
-        else if(!simOut){ slot = 'out'; simOut = true; }
-      }
-      const s = {file: f, url: URL.createObjectURL(f), ocr: 'pending', slot};
+      const s = {file: f, url: URL.createObjectURL(f), ocr: 'pending'};
       cur.staged.push(s);
       recognizeStaged(cur, s);
     }
