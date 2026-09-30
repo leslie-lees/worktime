@@ -125,6 +125,18 @@ h1{font-size:20px;margin:0}
   font-size:10px;padding:1px 6px;border-radius:8px}
 .imgs .add{border:1.5px dashed var(--line);font-size:26px;color:var(--sub)}
 .hint{font-size:12px;color:var(--sub);margin:6px 0 0}
+.bulk-note{font-size:12px;color:var(--sub);background:var(--bg);border-radius:11px;padding:10px 12px;margin-bottom:12px}
+.bulk-progress{height:6px;background:var(--line);border-radius:10px;overflow:hidden;margin:8px 0 14px}
+.bulk-progress i{display:block;height:100%;background:var(--brand);transition:width .25s}
+.bulk-list{display:flex;flex-direction:column;gap:10px}
+.bulk-item{display:grid;grid-template-columns:74px 1fr;gap:10px;padding:10px;border:1px solid var(--line);border-radius:13px}
+.bulk-item>img{width:74px;height:96px;object-fit:cover;border-radius:8px;background:var(--bg)}
+.bulk-item .name{font-size:11px;color:var(--sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:7px}
+.bulk-item .fields{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:6px}
+.bulk-item .fields label{font-size:10px;color:var(--sub)}
+.bulk-item .fields input{width:100%;min-width:0;margin-top:3px;padding:8px 5px;border-radius:8px;border:1px solid var(--line);background:var(--bg);font-size:13px}
+.bulk-item .state{font-size:13px;color:var(--sub);padding-top:12px}
+.bulk-item .state.ok{color:var(--ok)}.bulk-item .state.warn{color:var(--warn)}
 .leave-toggle{display:flex;align-items:center;justify-content:space-between;padding:12px;border-radius:12px;
   background:var(--leave-weak);color:var(--leave);font-weight:600;margin-bottom:12px}
 .switch{width:46px;height:27px;border-radius:20px;background:var(--line);position:relative;transition:.2s;flex:none}
@@ -161,6 +173,7 @@ h1{font-size:20px;margin:0}
 </div></header>
 
 <main class="wrap" id="app"></main>
+<input type="file" id="bulkFile" accept="image/*" multiple hidden>
 
 <div class="mask" id="mask"></div>
 <div class="sheet" id="sheet"><div class="in" id="sheetIn"></div></div>
@@ -209,6 +222,7 @@ let viewMonth = ymd(new Date()).slice(0,7);
 let showWeekend = store.get('wt_weekend', false);
 let editing = null;
 let viewing = null;
+let bulkImport = null;
 const blobCache = new Map();
 
 /* ---------- GitHub API ---------- */
@@ -361,7 +375,7 @@ function getOcrWorker(){
     ocrWorkerLoad = loadTesseract().then(async Tesseract => {
       const worker = await Tesseract.createWorker('eng');
       await worker.setParameters({
-        tessedit_char_whitelist: '0123456789:：.;',
+        tessedit_char_whitelist: '0123456789:：.;/-',
         tessedit_pageseg_mode: '11', // sparse text：打卡截图里的时间通常散落在不同卡片中
         preserve_interword_spaces: '1'
       });
@@ -376,6 +390,16 @@ const normalizeOcrTime = raw => {
   const s = String(raw || '').replace(/[Oo]/g, '0').replace(/[Il|]/g, '1');
   const m = s.match(/(?:^|\D)([01]?\d|2[0-3])\s*[:：.;]\s*([0-5]\d)(?!\d)/);
   return m ? `${m[1].padStart(2,'0')}:${m[2]}` : null;
+};
+
+const normalizeOcrDate = raw => {
+  const s = String(raw || '').replace(/[Oo]/g, '0').replace(/[Il|]/g, '1');
+  const m = s.match(/(?:^|\D)(20\d{2})\s*(?:年|[-/.]|\s+)\s*(\d{1,2})\s*(?:月|[-/.]|\s+)\s*(\d{1,2})\s*日?/);
+  if(!m) return null;
+  const y = +m[1], mon = +m[2], day = +m[3];
+  const d = new Date(y, mon - 1, day);
+  if(d.getFullYear() !== y || d.getMonth() !== mon - 1 || d.getDate() !== day) return null;
+  return `${y}-${p2(mon)}-${p2(day)}`;
 };
 
 async function decodeOcrImage(file){
@@ -466,6 +490,19 @@ function collectOcrCandidates(data, originalWidth, imageHeight){
     (b.statusBar ? 0 : 1) - (a.statusBar ? 0 : 1) || b.h - a.h || b.confidence - a.confidence);
 }
 
+function collectOcrDate(data){
+  const texts = [data.text || ''];
+  for(const w of (data.words || [])) texts.push(w.text || '');
+  for(const block of (data.blocks || []))
+    for(const para of (block.paragraphs || []))
+      for(const line of (para.lines || [])) texts.push(line.text || '');
+  for(const text of texts){
+    const date = normalizeOcrDate(text);
+    if(date) return date;
+  }
+  return null;
+}
+
 // 返回主时间及全部候选。字号最大的非状态栏时间通常就是圆形打卡按钮上的当前时间。
 async function ocrTimes(file){
   try{
@@ -473,10 +510,10 @@ async function ocrTimes(file){
     const prep = await makeOcrCanvas(file);
     const {data} = await worker.recognize(prep.canvas, {}, {blocks:true, text:true});
     const candidates = collectOcrCandidates(data, prep.originalWidth, prep.height);
-    return {primary: candidates[0]?.time || null, candidates};
+    return {date: collectOcrDate(data), primary: candidates[0]?.time || null, candidates};
   }catch(err){
     console.warn('OCR failed', err);
-    return {primary:null, candidates:[]};
+    return {date:null, primary:null, candidates:[]};
   }
 }
 
@@ -677,6 +714,7 @@ function render(){
       <div class="nav"><button data-act="prev">‹</button><span>${y}年${+m}月</span><button data-act="next">›</button></div>
       <div class="tools">
         <button class="chip ${showWeekend ? 'on' : ''}" data-act="weekend">周末</button>
+        <button class="chip" data-act="bulkPick">批量导入</button>
         <button class="chip" data-act="edit" data-date="${ymd(new Date())}" data-pick="1">补记</button>
       </div>
     </div>` + renderSummary() + renderList();
@@ -685,9 +723,12 @@ function render(){
 /* ---------- 编辑面板 ---------- */
 function openSheet(){ $('#mask').classList.add('show'); $('#sheet').classList.add('show'); }
 function closeSheet(){
+  if(bulkImport?.saving){ toast('正在保存，请稍候'); return; }
   $('#mask').classList.remove('show'); $('#sheet').classList.remove('show');
   if(editing){ editing.staged.forEach(s => URL.revokeObjectURL(s.url)); }
+  if(bulkImport){ bulkImport.items.forEach(i => URL.revokeObjectURL(i.url)); }
   editing = null;
+  bulkImport = null;
 }
 
 function startEdit(date){
@@ -756,6 +797,141 @@ async function hydrateThumbs(){
 
 function refreshPreview(){
   const pv = $('#prev'); if(pv) pv.innerHTML = previewLine();
+}
+
+function syncBulkInputs(){
+  if(!bulkImport || bulkImport.running) return;
+  for(const input of document.querySelectorAll('[data-bulk-field]')){
+    const item = bulkImport.items[+input.dataset.k];
+    if(item) item[input.dataset.bulkField] = input.value;
+  }
+}
+
+function renderBulkSheet(){
+  const b = bulkImport;
+  if(!b) return;
+  const done = b.items.filter(i => i.status !== 'pending').length;
+  const rows = b.items.map((item, k) => {
+    if(b.running){
+      const msg = item.status === 'pending' ? (k === done ? '正在识别日期和时间…' : '等待识别') :
+        item.date ? `${item.date}　${item.in || '--:--'} – ${item.out || '--:--'}` : '未识别到日期，稍后可手动填写';
+      return `<div class="bulk-item"><img src="${item.url}" alt=""><div><div class="name">${esc(item.file.name)}</div><div class="state ${item.status === 'done' ? (item.date ? 'ok' : 'warn') : ''}">${msg}</div></div></div>`;
+    }
+    return `<div class="bulk-item"><img src="${item.url}" alt=""><div>
+      <div class="name">${esc(item.file.name)}</div>
+      <div class="fields">
+        <label>日期<input type="date" data-bulk-field="date" data-k="${k}" value="${esc(item.date)}" max="${ymd(new Date())}"></label>
+        <label>上班<input type="time" data-bulk-field="in" data-k="${k}" value="${esc(item.in)}"></label>
+        <label>下班<input type="time" data-bulk-field="out" data-k="${k}" value="${esc(item.out)}"></label>
+      </div>
+      <button class="hint" data-act="bulkRemove" data-k="${k}" style="color:var(--warn);padding:6px 0">移除这张</button>
+    </div></div>`;
+  }).join('');
+  $('#sheetIn').innerHTML = `
+    <h2><span>批量导入 ${b.items.length} 张</span><button data-act="closeSheet" aria-label="关闭">×</button></h2>
+    <div class="bulk-note">${b.running ? '正在逐张识别，请保持页面打开。首次使用需下载 OCR 模型，可能稍慢。' : '请核对每张截图的日期和时间。相同日期会自动合并，已有的手工时间不会被覆盖。'}</div>
+    ${b.running ? `<div class="bulk-progress"><i style="width:${b.items.length ? done/b.items.length*100 : 0}%"></i></div>` : ''}
+    <div class="bulk-list">${rows}</div>
+    ${b.running ? '' : `<div class="actions"><button class="btn ghost" data-act="bulkAdd">继续添加</button><button class="btn primary" data-act="bulkSave" id="btnBulkSave">确认保存</button></div>`}`;
+}
+
+async function startBulkImport(files, append = false){
+  if(!files.length) return;
+  let job = bulkImport;
+  if(!append || !job){
+    if(editing) editing.staged.forEach(s => URL.revokeObjectURL(s.url));
+    editing = null;
+    if(job) job.items.forEach(i => URL.revokeObjectURL(i.url));
+    job = bulkImport = {items:[], running:true, saving:false};
+    openSheet();
+  } else {
+    syncBulkInputs();
+    job.running = true;
+  }
+  const added = files.map(file => ({file, url:URL.createObjectURL(file), status:'pending', date:'', in:'', out:''}));
+  job.items.push(...added);
+  renderBulkSheet();
+  for(const item of added){
+    const result = await ocrTimes(item.file);
+    if(bulkImport !== job) return;
+    item.result = result;
+    item.date = result.date || '';
+    const detected = {in:'', out:'', leave:false};
+    applyRecognizedTimes(detected, result);
+    item.in = detected.in; item.out = detected.out;
+    item.status = 'done';
+    renderBulkSheet();
+  }
+  if(bulkImport !== job) return;
+  job.running = false;
+  renderBulkSheet();
+  const missing = job.items.filter(i => !i.date).length;
+  toast(missing ? `识别完成，${missing} 张未识别到日期，请手动补充` : `已识别 ${job.items.length} 张，请核对后保存`);
+}
+
+async function commitBulkRecords(uploaded){
+  const groups = new Map();
+  for(const {item, meta} of uploaded){
+    let g = groups.get(item.date);
+    if(!g) groups.set(item.date, g = {in:'', out:'', imgs:[]});
+    if(item.in && (!g.in || tm(item.in) < tm(g.in))) g.in = item.in;
+    if(item.out && (!g.out || tm(item.out) > tm(g.out))) g.out = item.out;
+    g.imgs.push(meta);
+  }
+  await commitRecords(rs => {
+    for(const [date, g] of groups){
+      const cur = rs[date] || {};
+      rs[date] = {
+        in: cur.in || g.in,
+        out: cur.out || g.out,
+        leave: !!cur.leave,
+        imgs: (cur.imgs || []).concat(g.imgs)
+      };
+    }
+  }, `bulk import ${groups.size} days`);
+}
+
+async function saveBulkImport(){
+  const job = bulkImport;
+  if(!job || job.running || job.saving) return;
+  syncBulkInputs();
+  if(!job.items.length){ closeSheet(); return; }
+  const invalid = job.items.find(i => !/^20\d{2}-\d{2}-\d{2}$/.test(i.date));
+  if(invalid){ toast('请先为每张截图填写正确日期'); return; }
+  const badTime = job.items.find(i => i.in && i.out && tm(i.out) <= tm(i.in));
+  if(badTime){ toast(`${badTime.date} 的下班时间需晚于上班时间`); return; }
+  job.saving = true;
+  const uploaded = [];
+  let btn = $('#btnBulkSave');
+  btn.disabled = true;
+  try{
+    for(let k = 0; k < job.items.length; k++){
+      const item = job.items[k], f = item.file;
+      const ts = Date.now() + k;
+      const ext = ((f.name.split('.').pop() || '').toLowerCase().replace(/[^a-z0-9]/g, '')) || (f.type.split('/')[1] || 'jpg');
+      const path = `images/${item.date}/${ts}.${ext}`;
+      const label = `上传 ${k+1}/${job.items.length}`;
+      btn.textContent = label + ' · 0%';
+      await putFile(path, f, `upload ${path}`, frac => { btn.textContent = `${label} · ${Math.round(frac*100)}%`; });
+      const meta = {path, name:f.name || `${ts}.${ext}`, size:f.size, type:f.type || MIME[ext] || '', ts};
+      const th = await makeThumb(f);
+      if(th){
+        try{ await putFile(meta.thumb = `thumbs/${item.date}/${ts}.jpg`, th, `thumb ${meta.thumb}`); }
+        catch{ delete meta.thumb; }
+      }
+      uploaded.push({item, meta});
+    }
+    btn.textContent = '保存记录中…';
+    await commitBulkRecords(uploaded);
+    job.saving = false;
+    closeSheet(); render(); toast(`已导入 ${uploaded.length} 张截图`);
+  }catch(err){
+    for(const {meta} of uploaded){ deleteFile(meta.path); if(meta.thumb) deleteFile(meta.thumb); }
+    job.saving = false;
+    btn = $('#btnBulkSave');
+    if(btn){ btn.disabled = false; btn.textContent = '重新保存'; }
+    toast('批量保存失败：' + err.message);
+  }
 }
 
 async function commitImageMetas(oldDate, newDate, metas, removed, timeFields){
@@ -932,6 +1108,17 @@ document.addEventListener('click', e => {
   const a = el.dataset.act;
   switch(a){
     case 'edit': startEdit(el.dataset.date); break;
+    case 'bulkPick': $('#bulkFile').dataset.append = '0'; $('#bulkFile').click(); break;
+    case 'bulkAdd': $('#bulkFile').dataset.append = '1'; $('#bulkFile').click(); break;
+    case 'bulkRemove': {
+      if(!bulkImport || bulkImport.running) break;
+      syncBulkInputs();
+      const [item] = bulkImport.items.splice(+el.dataset.k, 1);
+      if(item) URL.revokeObjectURL(item.url);
+      if(bulkImport.items.length) renderBulkSheet(); else closeSheet();
+      break;
+    }
+    case 'bulkSave': saveBulkImport(); break;
     case 'quickLeave': quickLeave(el.dataset.date); break;
     case 'prev': case 'next': {
       const [y, m] = viewMonth.split('-').map(Number);
@@ -967,7 +1154,12 @@ document.addEventListener('click', e => {
 });
 
 document.addEventListener('change', e => {
-  if(e.target.id === 'fFile'){
+  if(e.target.id === 'bulkFile'){
+    const files = [...e.target.files];
+    const append = e.target.dataset.append === '1';
+    e.target.value = '';
+    startBulkImport(files, append);
+  } else if(e.target.id === 'fFile'){
     const files = [...e.target.files];
     const cur = editing;
     cur.in = $('#fIn').value; cur.out = $('#fOut').value;
@@ -1001,7 +1193,7 @@ $('#vDel').addEventListener('click', () => {
   editing.in = $('#fIn').value; editing.out = $('#fOut').value;
   renderSheet();
 });
-document.addEventListener('visibilitychange', () => { if(!document.hidden && !editing) refresh(); });
+document.addEventListener('visibilitychange', () => { if(!document.hidden && !editing && !bulkImport) refresh(); });
 
 render();
 if(cfg){ setSync('busy', '同步中…'); refresh(); }
