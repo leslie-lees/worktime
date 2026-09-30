@@ -126,6 +126,8 @@ h1{font-size:20px;margin:0}
 .imgs .add{border:1.5px dashed var(--line);font-size:26px;color:var(--sub)}
 .hint{font-size:12px;color:var(--sub);margin:6px 0 0}
 .bulk-note{font-size:12px;color:var(--sub);background:var(--bg);border-radius:11px;padding:10px 12px;margin-bottom:12px}
+.bulk-month{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:var(--sub);margin-bottom:12px}
+.bulk-month input{padding:7px 9px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text);font:inherit}
 .bulk-progress{height:6px;background:var(--line);border-radius:10px;overflow:hidden;margin:8px 0 14px}
 .bulk-progress i{display:block;height:100%;background:var(--brand);transition:width .25s}
 .bulk-list{display:flex;flex-direction:column;gap:10px}
@@ -392,14 +394,15 @@ function getOcrWorker(){
 }
 
 const OCR_MAX_SIDE = 1800;
+const stripOcrDates = s => s.replace(/20\d{2}\s*(?:年|[-/.]|\s+)\s*\d{1,2}\s*(?:月|[-/.]|\s+)\s*\d{1,2}\s*日?/g, ' ');
 const normalizeOcrTime = raw => {
-  const s = String(raw || '').replace(/[Oo]/g, '0').replace(/[Il|]/g, '1');
+  const s = stripOcrDates(String(raw || '').replace(/[Oo]/g, '0').replace(/[Il|]/g, '1'));
   const m = s.match(/(?:^|\D)([01]?\d|2[0-3])\s*[:：.;]\s*([0-5]\d)(?!\d)/);
   return m ? `${m[1].padStart(2,'0')}:${m[2]}` : null;
 };
 
 const extractOcrTimes = raw => {
-  const s = String(raw || '').replace(/[Oo]/g, '0').replace(/[Il|]/g, '1');
+  const s = stripOcrDates(String(raw || '').replace(/[Oo]/g, '0').replace(/[Il|]/g, '1'));
   const out = [];
   const re = /(?:^|\D)([01]?\d|2[0-3])\s*[:：.;]\s*([0-5]\d)(?!\d)/g;
   for(const m of s.matchAll(re)) out.push(`${m[1].padStart(2,'0')}:${m[2]}`);
@@ -531,30 +534,44 @@ function timesToFields(times){
 
 // 从 OCR 行的坐标关系中，把每个时间归到离它最近的日期区段。
 // 左右两半分别是原图和反白增强图，最后按日期合并两边的结果。
-function collectAttendanceEntries(data, originalWidth, imageHeight){
+function collectAttendanceEntries(data, originalWidth, imageHeight, fallbackMonth = ''){
   const lines = [];
   for(const block of (data.blocks || []))
     for(const para of (block.paragraphs || []))
       for(const line of (para.lines || [])) lines.push(line);
   if(!lines.length) for(const w of (data.words || [])) lines.push(w);
 
-  const anchors = [], timeMarks = [];
+  const anchors = [], dayAnchors = [], timeMarks = [];
+  const variantFor = b => (Number(b.x0 || 0) + Number(b.x1 || 0)) / 2 >= originalWidth ? 'light-text' : 'original';
+  const addDay = (text, b) => {
+    const m = String(text || '').trim().match(/^(\d{1,2})$/);
+    if(!m) return;
+    const day = +m[1];
+    const centerX = (Number(b.x0 || 0) + Number(b.x1 || 0)) / 2;
+    const localX = centerX >= originalWidth ? centerX - originalWidth : centerX;
+    const y = (Number(b.y0 || 0) + Number(b.y1 || 0)) / 2;
+    if(day >= 1 && day <= 31 && localX < originalWidth * .28 && y > imageHeight * .08)
+      dayAnchors.push({day, y, variant:variantFor(b)});
+  };
   for(const line of lines){
     const b = line.bbox || {}, x0 = Number(b.x0 || 0), x1 = Number(b.x1 || 0);
     const y0 = Number(b.y0 || 0), y1 = Number(b.y1 || 0), y = (y0 + y1) / 2;
-    const variant = (x0 + x1) / 2 >= originalWidth ? 'light-text' : 'original';
+    const variant = variantFor(b);
     for(const date of extractOcrDates(line.text || '')) anchors.push({date, y, variant});
+    addDay(line.text, b);
     if(!(imageHeight && y1 < imageHeight * .08))
       for(const time of extractOcrTimes(line.text || '')) timeMarks.push({time, y, variant});
     // 行文本可能被 OCR 拆坏；单词级结果作为补充。
     for(const w of (line.words || [])){
       const wb = w.bbox || {}, wy = (Number(wb.y0 || 0) + Number(wb.y1 || 0)) / 2;
+      const wVariant = variantFor(wb);
+      addDay(w.text, wb);
       if(!(imageHeight && Number(wb.y1 || 0) < imageHeight * .08))
-        for(const time of extractOcrTimes(w.text || '')) timeMarks.push({time, y:wy, variant});
+        for(const time of extractOcrTimes(w.text || '')) timeMarks.push({time, y:wy, variant:wVariant});
     }
   }
 
-  const gathered = new Map();
+  const gathered = new Map(), inferred = new Set();
   for(const variant of ['original','light-text']){
     const ds = anchors.filter(a => a.variant === variant && a.y > 0).sort((a,b) => a.y - b.y);
     const ts = timeMarks.filter(t => t.variant === variant && t.y > 0);
@@ -564,6 +581,28 @@ function collectAttendanceEntries(data, originalWidth, imageHeight){
       const times = ts.filter(t => t.y >= low && t.y < high).map(t => t.time);
       if(!gathered.has(ds[i].date)) gathered.set(ds[i].date, []);
       gathered.get(ds[i].date).push(...times);
+    }
+  }
+
+  // 月度列表常只显示“17、16…”这样的日号。利用左栏位置识别日号，
+  // 再以当前查看月份作为截图未展示年月时的显式兜底。
+  if(/^20\d{2}-\d{2}$/.test(fallbackMonth)){
+    for(const variant of ['original','light-text']){
+      const seen = new Set();
+      const ds = dayAnchors.filter(a => a.variant === variant)
+        .sort((a,b) => a.y - b.y)
+        .filter(a => { const key = `${a.day}:${Math.round(a.y/8)}`; if(seen.has(key)) return false; seen.add(key); return true; });
+      const ts = timeMarks.filter(t => t.variant === variant);
+      for(let i = 0; i < ds.length; i++){
+        const low = i ? (ds[i-1].y + ds[i].y) / 2 : -Infinity;
+        const high = i+1 < ds.length ? (ds[i].y + ds[i+1].y) / 2 : Infinity;
+        const times = ts.filter(t => t.y >= low && t.y < high).map(t => t.time);
+        if(!times.length) continue; // 跳过“未打卡”和“非工作日”
+        const date = normalizeOcrDate(`${fallbackMonth}-${p2(ds[i].day)}`);
+        if(!date) continue;
+        if(!gathered.has(date)){ gathered.set(date, []); inferred.add(date); }
+        gathered.get(date).push(...times);
+      }
     }
   }
 
@@ -581,18 +620,37 @@ function collectAttendanceEntries(data, originalWidth, imageHeight){
     }
   }
 
-  return [...gathered].map(([date, times]) => ({date, ...timesToFields(times)})).sort((a,b) => a.date.localeCompare(b.date));
+  return [...gathered].map(([date, times]) => ({date, ...timesToFields(times), inferred:inferred.has(date), day:+date.slice(-2)}))
+    .sort((a,b) => a.date.localeCompare(b.date));
 }
 
 // 返回主时间及全部候选。字号最大的非状态栏时间通常就是圆形打卡按钮上的当前时间。
-async function ocrTimes(file){
+async function ocrTimes(file, options = {}){
   try{
     const worker = await getOcrWorker();
     const prep = await makeOcrCanvas(file);
     const {data} = await worker.recognize(prep.canvas, {}, {blocks:true, text:true});
     const candidates = collectOcrCandidates(data, prep.originalWidth, prep.height);
-    const entries = collectAttendanceEntries(data, prep.originalWidth, prep.height);
-    return {date: entries[0]?.date || collectOcrDate(data), primary: candidates[0]?.time || null, candidates, entries};
+    const entries = collectAttendanceEntries(data, prep.originalWidth, prep.height, options.fallbackMonth || '');
+    const fullDate = collectOcrDate(data);
+    let focusTime = null;
+    // 当天打卡页的大号当前时间位于页面中部彩色圆圈中；整页 OCR 容易忽略它，
+    // 对反白增强图的中部单独再识别一次。
+    if(fullDate){
+      try{
+        const crop = {
+          left: Math.round(prep.originalWidth * 1.28), top: Math.round(prep.height * .49),
+          width: Math.round(prep.originalWidth * .44), height: Math.round(prep.height * .13)
+        };
+        const focused = await worker.recognize(prep.canvas, {rectangle:crop}, {text:true});
+        focusTime = extractOcrTimes(focused.data.text || '')[0] || null;
+      }catch(err){ console.warn('Focused OCR failed', err); }
+      if(entries.length === 1 && focusTime){
+        if(tm(focusTime) < 12*60){ if(!entries[0].in || tm(focusTime) < tm(entries[0].in)) entries[0].in = focusTime; }
+        else if(!entries[0].out || tm(focusTime) > tm(entries[0].out)) entries[0].out = focusTime;
+      }
+    }
+    return {date: entries[0]?.date || fullDate, primary:focusTime || candidates[0]?.time || null, candidates, entries};
   }catch(err){
     console.warn('OCR failed', err);
     return {date:null, primary:null, candidates:[], entries:[]};
@@ -893,6 +951,15 @@ function syncBulkInputs(){
 function renderBulkSheet(){
   const b = bulkImport;
   if(!b) return;
+  const monthControl = `<label class="bulk-month"><span>先选择考勤截图所属月份</span><input type="month" id="bulkMonth" value="${b.month}" max="${ymd(new Date()).slice(0,7)}" ${b.running ? 'disabled' : ''}></label>`;
+  if(!b.items.length){
+    $('#sheetIn').innerHTML = `
+      <h2><span>批量导入</span><button data-act="closeSheet" aria-label="关闭">×</button></h2>
+      ${monthControl}
+      <div class="bulk-note">月度列表截图只显示日号，请先选择正确月份；带完整日期的当天截图会优先使用图片里的日期。</div>
+      <button class="btn primary" data-act="bulkChoose" style="width:100%">选择考勤截图</button>`;
+    return;
+  }
   const done = b.items.filter(i => i.status !== 'pending').length;
   const rows = b.items.map((item, k) => {
     if(b.running){
@@ -916,10 +983,19 @@ function renderBulkSheet(){
   }).join('');
   $('#sheetIn').innerHTML = `
     <h2><span>批量导入 ${b.items.length} 张</span><button data-act="closeSheet" aria-label="关闭">×</button></h2>
+    ${monthControl}
     <div class="bulk-note">${b.running ? '正在逐张识别并拆分其中的多天记录，请保持页面打开。首次使用需下载 OCR 模型，可能稍慢。' : '一张截图可展开为多天，请逐条核对日期和时间。相同日期会自动合并，已有的手工时间不会被覆盖。'}</div>
     ${b.running ? `<div class="bulk-progress"><i style="width:${b.items.length ? done/b.items.length*100 : 0}%"></i></div>` : ''}
     <div class="bulk-list">${rows}</div>
     ${b.running ? '' : `<div class="actions"><button class="btn ghost" data-act="bulkAdd">继续添加</button><button class="btn primary" data-act="bulkSave" id="btnBulkSave">确认保存</button></div>`}`;
+}
+
+function openBulkSetup(){
+  if(editing) editing.staged.forEach(s => URL.revokeObjectURL(s.url));
+  if(bulkImport) bulkImport.items.forEach(i => URL.revokeObjectURL(i.url));
+  editing = null;
+  bulkImport = {items:[], running:false, saving:false, month:viewMonth};
+  renderBulkSheet(); openSheet();
 }
 
 async function startBulkImport(files, append = false){
@@ -929,7 +1005,7 @@ async function startBulkImport(files, append = false){
     if(editing) editing.staged.forEach(s => URL.revokeObjectURL(s.url));
     editing = null;
     if(job) job.items.forEach(i => URL.revokeObjectURL(i.url));
-    job = bulkImport = {items:[], running:true, saving:false};
+    job = bulkImport = {items:[], running:true, saving:false, month:viewMonth};
     openSheet();
   } else {
     syncBulkInputs();
@@ -939,11 +1015,11 @@ async function startBulkImport(files, append = false){
   job.items.push(...added);
   renderBulkSheet();
   for(const item of added){
-    const result = await ocrTimes(item.file);
+    const result = await ocrTimes(item.file, {fallbackMonth:job.month});
     if(bulkImport !== job) return;
     item.result = result;
-    item.entries = (result.entries || []).map(x => ({date:x.date || '', in:x.in || '', out:x.out || ''}));
-    if(!item.entries.length) item.entries.push({date:result.date || '', in:'', out:''});
+    item.entries = (result.entries || []).map(x => ({date:x.date || '', in:x.in || '', out:x.out || '', inferred:!!x.inferred, day:x.day || 0}));
+    if(!item.entries.length) item.entries.push({date:result.date || '', in:'', out:'', inferred:false, day:0});
     if(item.entries.length === 1 && !item.entries[0].in && !item.entries[0].out){
       const detected = {in:'', out:'', leave:false};
       applyRecognizedTimes(detected, result);
@@ -1202,7 +1278,8 @@ document.addEventListener('click', e => {
   const a = el.dataset.act;
   switch(a){
     case 'edit': startEdit(el.dataset.date); break;
-    case 'bulkPick': $('#bulkFile').dataset.append = '0'; $('#bulkFile').click(); break;
+    case 'bulkPick': openBulkSetup(); break;
+    case 'bulkChoose': $('#bulkFile').dataset.append = '1'; $('#bulkFile').click(); break;
     case 'bulkAdd': $('#bulkFile').dataset.append = '1'; $('#bulkFile').click(); break;
     case 'bulkAddEntry': {
       if(!bulkImport || bulkImport.running) break;
@@ -1268,6 +1345,17 @@ document.addEventListener('change', e => {
     const append = e.target.dataset.append === '1';
     e.target.value = '';
     startBulkImport(files, append);
+  } else if(e.target.id === 'bulkMonth' && bulkImport){
+    syncBulkInputs();
+    bulkImport.month = e.target.value;
+    for(const item of bulkImport.items) for(const entry of item.entries){
+      if(entry.inferred && entry.day) entry.date = normalizeOcrDate(`${bulkImport.month}-${p2(entry.day)}`) || '';
+    }
+    renderBulkSheet();
+  } else if(e.target.dataset.bulkField === 'date' && bulkImport){
+    syncBulkInputs();
+    const entry = bulkImport.items[+e.target.dataset.k]?.entries[+e.target.dataset.j];
+    if(entry) entry.inferred = false;
   } else if(e.target.id === 'fFile'){
     const files = [...e.target.files];
     const cur = editing;
