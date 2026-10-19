@@ -144,11 +144,11 @@ h1{font-size:20px;margin:0}
 .bulk-item .fields input{width:100%;min-width:0;margin-top:3px;padding:8px 5px;border-radius:8px;border:1px solid var(--line);background:var(--bg);font-size:13px}
 .bulk-item .state{font-size:13px;color:var(--sub);padding-top:12px}
 .bulk-item .state.ok{color:var(--ok)}.bulk-item .state.warn{color:var(--warn)}
-.leave-toggle{display:flex;align-items:center;justify-content:space-between;padding:12px;border-radius:12px;
-  background:var(--leave-weak);color:var(--leave);font-weight:600;margin-bottom:12px}
-.switch{width:46px;height:27px;border-radius:20px;background:var(--line);position:relative;transition:.2s;flex:none}
-.switch::after{content:"";position:absolute;top:3px;left:3px;width:21px;height:21px;border-radius:50%;background:#fff;transition:.2s}
-.switch.on{background:var(--leave)}.switch.on::after{left:22px}
+.day-type-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.day-type-btn{padding:12px;border-radius:12px;background:var(--bg);color:var(--sub);font-weight:600;
+  box-shadow:0 1px 5px rgba(30,50,90,.035);transition:background .18s,color .18s,box-shadow .18s}
+.day-type-btn.holiday.on{background:var(--warn-weak);color:var(--warn);box-shadow:0 1px 6px rgba(232,89,12,.06)}
+.day-type-btn.leave.on{background:var(--leave-weak);color:var(--leave);box-shadow:0 1px 6px rgba(138,99,210,.06)}
 
 .viewer{position:fixed;inset:0;z-index:30;background:#000;display:none;flex-direction:column}
 .viewer.show{display:flex}
@@ -224,7 +224,7 @@ const store = {
 };
 
 let cfg = store.get('wt_cfg', null);           // {token, repo}
-let records = store.get('wt_records', {});     // {date: {in,out,leave,imgs:[]}}
+let records = store.get('wt_records', {});     // {date: {in,out,leave,offType,imgs:[]}}
 let viewMonth = ymd(new Date()).slice(0,7);
 let editing = null;
 let viewing = null;
@@ -662,7 +662,7 @@ async function ocrTimes(file, options = {}){
 
 function applyRecognizedTimes(cur, result){
   const primary = result.primary;
-  if(!primary || cur.leave) return [];
+  if(!primary || cur.dayType) return [];
   const changed = [];
   const minutes = t => { const [h,m] = t.split(':').map(Number); return h*60+m; };
   const all = [...new Set(result.candidates.map(c => c.time))];
@@ -727,9 +727,15 @@ async function loadBlob(path, type){
 }
 
 /* ---------- 计算 ---------- */
+function dayType(r){
+  if(r?.offType === 'holiday' || r?.offType === 'leave') return r.offType;
+  return r?.leave ? 'leave' : '';
+}
+
 function calc(r){
   if(!r) return {state:'none'};
-  if(r.leave) return {state:'leave'};
+  const off = dayType(r);
+  if(off) return {state:off};
   if(r.in && r.out){
     const a = tm(r.in), b = tm(r.out);
     if(b <= a) return {state:'bad'};
@@ -741,14 +747,15 @@ function calc(r){
 }
 
 function monthStats(prefix){
-  let net = 0, days = 0, reached = 0, leave = 0, worked = 0;
+  let net = 0, days = 0, reached = 0, leave = 0, holiday = 0, worked = 0;
   for(const [d, r] of Object.entries(records)){
     if(prefix && !d.startsWith(prefix)) continue;
     const c = calc(r);
     if(c.state === 'leave') leave++;
+    if(c.state === 'holiday') holiday++;
     if(c.state === 'done'){ net += c.diff; days++; worked += c.worked; if(c.diff >= 0) reached++; }
   }
-  return {net, days, reached, leave, avg: days ? worked/days : 0};
+  return {net, days, reached, leave, holiday, avg: days ? worked/days : 0};
 }
 
 const netText = (m, prefix='') => m >= 0 ? `${prefix}超出 ${dur(m)}` : `${prefix}不足 ${dur(m)}`;
@@ -762,6 +769,7 @@ function setSync(kind, txt){
 
 function badge(c){
   switch(c.state){
+    case 'holiday': return '<span class="badge warn">节假日</span>';
     case 'leave': return '<span class="badge leave">请假</span>';
     case 'done':  return c.diff >= 0 ? '<span class="badge ok">已达到 ✓</span>' : `<span class="badge warn">差 ${dur(c.diff)}</span>`;
     case 'partial': return '<span class="badge doing">进行中</span>';
@@ -773,7 +781,8 @@ function badge(c){
 function renderToday(){
   const now = new Date(), key = ymd(now), r = records[key], c = calc(r);
   let big = '未打卡', desc = '', cls = '';
-  if(c.state === 'leave'){ big = '今日请假'; desc = '这一天不计入统计'; }
+  if(c.state === 'holiday'){ big = '今日节假日'; desc = '这一天不计入统计'; }
+  else if(c.state === 'leave'){ big = '今日请假'; desc = '这一天不计入统计'; }
   else if(c.state === 'done'){
     big = dur(c.worked);
     desc = c.diff >= 0 ? `已达到 8.3 小时，超出 ${dur(c.diff)}` : `距离 8.3 小时还差 ${dur(c.diff)}`;
@@ -782,7 +791,7 @@ function renderToday(){
     const reach = tm(r.in) + TARGET + LUNCH;
     desc = `预计 ${hm(reach)} 打卡下班即满 8.3 小时`;
   } else if(c.state === 'bad'){ big = '时间有误'; desc = '下班时间需晚于上班时间'; }
-  const times = c.state === 'leave' ? '' :
+  const times = (c.state === 'leave' || c.state === 'holiday') ? '' :
     `<div class="times"><div><span>上班</span><b>${esc(r?.in || '--:--')}</b></div>
      <div><span>下班</span><b>${esc(r?.out || '--:--')}</b></div>
      <div><span>状态</span>${badge(c)}</div></div>`;
@@ -834,7 +843,8 @@ function renderList(){
   return '<ul class="list">' + days.map(({key, dow, weekend}) => {
     const r = records[key], c = calc(r);
     let mid = '<div class="t" style="color:var(--sub)">—</div>', sub = '';
-    if(c.state === 'leave') mid = '<div class="t">请假</div>';
+    if(c.state === 'holiday') mid = '<div class="t">节假日</div>';
+    else if(c.state === 'leave') mid = '<div class="t">请假</div>';
     else if(r && (r.in || r.out)) mid = `<div class="t">${esc(r.in || '--:--')} – ${esc(r.out || '--:--')}</div>`;
     if(c.state === 'done') sub = `<div class="s">工作 ${dur(c.worked)}</div>`;
     const n = r?.imgs?.length || 0;
@@ -893,7 +903,7 @@ function startEdit(date){
   const r = records[date] || {};
   if(editing) editing.staged.forEach(s => URL.revokeObjectURL(s.url));
   editing = {
-    date, in: r.in || '', out: r.out || '', leave: !!r.leave,
+    date, in: r.in || '', out: r.out || '', dayType: dayType(r),
     imgs: (r.imgs || []).map(i => ({...i})), staged: [], removed: new Set(), mode: 'sheet'
   };
   renderSheet();
@@ -901,7 +911,8 @@ function startEdit(date){
 }
 
 function previewLine(){
-  const c = calc({in: editing.in, out: editing.out, leave: editing.leave});
+  const c = calc({in: editing.in, out: editing.out, offType: editing.dayType});
+  if(c.state === 'holiday') return '节假日，这一天不计入统计';
   if(c.state === 'leave') return '请假，这一天不计入统计';
   if(c.state === 'done'){
     const a = tm(editing.in), b = tm(editing.out);
@@ -920,8 +931,11 @@ function renderSheet(){
   $('#sheetIn').innerHTML = `
     <h2><span>${e.date} ${WD[d.getDay()]}</span><button data-act="closeSheet" aria-label="关闭">×</button></h2>
     <div class="field"><label>日期</label><input type="date" id="fDate" value="${e.date}" max="${ymd(new Date())}"></div>
-    <div class="leave-toggle" data-act="toggleLeave"><span>今天请假（不计入统计）</span><i class="switch ${e.leave ? 'on' : ''}"></i></div>
-    <div class="two" style="${e.leave ? 'opacity:.4;pointer-events:none' : ''}">
+    <div class="day-type-row" aria-label="当日类型">
+      <button type="button" class="day-type-btn holiday ${e.dayType === 'holiday' ? 'on' : ''}" data-act="setDayType" data-type="holiday">节假日</button>
+      <button type="button" class="day-type-btn leave ${e.dayType === 'leave' ? 'on' : ''}" data-act="setDayType" data-type="leave">请假</button>
+    </div>
+    <div class="two" style="${e.dayType ? 'opacity:.4;pointer-events:none' : ''}">
       <div class="field"><label>上班打卡</label><input type="time" id="fIn" value="${esc(e.in)}"></div>
       <div class="field"><label>下班打卡</label><input type="time" id="fOut" value="${esc(e.out)}"></div>
     </div>
@@ -1072,6 +1086,7 @@ async function commitBulkRecords(uploaded){
         in: cur.in || g.in,
         out: cur.out || g.out,
         leave: !!cur.leave,
+        offType: dayType(cur),
         imgs: (cur.imgs || []).concat(g.imgs)
       };
     }
@@ -1126,12 +1141,13 @@ async function commitImageMetas(oldDate, newDate, metas, removed, timeFields){
   await commitRecords(rs => {
     const cur = rs[oldDate] || {};
     const keep = (cur.imgs || []).filter(i => !removed.has(i.path));
-    const tf = timeFields || {in: cur.in || '', out: cur.out || '', leave: !!cur.leave};
-    const rec = {in: tf.in, out: tf.out, leave: tf.leave, imgs: keep.concat(metas)};
+    const tf = timeFields || {in: cur.in || '', out: cur.out || '', dayType: dayType(cur)};
+    const offType = tf.dayType || '';
+    const rec = {in: tf.in, out: tf.out, leave: offType === 'leave', offType, imgs: keep.concat(metas)};
     if(newDate !== oldDate && rs[oldDate]) delete rs[oldDate];
     const prev = rs[newDate];
     if(newDate !== oldDate && prev) rec.imgs = (prev.imgs || []).concat(rec.imgs);
-    if(rec.in || rec.out || rec.leave || rec.imgs.length) rs[newDate] = rec; else delete rs[newDate];
+    if(rec.in || rec.out || rec.offType || rec.imgs.length) rs[newDate] = rec; else delete rs[newDate];
   }, `record ${newDate}`);
 }
 
@@ -1172,7 +1188,7 @@ async function saveEditing(){
       metas.push(meta);
     }
     btn.textContent = '保存中…';
-    await commitImageMetas(oldDate, newDate, metas, removed, {in: e.in, out: e.out, leave: e.leave});
+    await commitImageMetas(oldDate, newDate, metas, removed, {in: e.in, out: e.out, dayType: e.dayType});
     for(const i of e.imgs) if(removed.has(i.path)) deleteImageIfUnused(i);
     closeSheet(); render(); toast('已保存并同步到云端');
   }catch(err){
@@ -1198,11 +1214,12 @@ async function saveEditing(){
 }
 
 async function quickLeave(date){
-  const cur = records[date]?.leave;
+  const cur = dayType(records[date]) === 'leave';
   try{
     await commitRecords(rs => {
       const r = rs[date] || {in:'', out:'', imgs:[]};
       r.leave = !cur;
+      r.offType = cur ? '' : 'leave';
       rs[date] = r;
     }, `${cur ? 'cancel leave' : 'leave'} ${date}`);
     render(); toast(cur ? '已取消请假' : '已标记请假，不计入统计');
@@ -1332,7 +1349,13 @@ document.addEventListener('click', e => {
       viewMonth = nm; render(); break;
     }
     case 'closeSheet': closeSheet(); break;
-    case 'toggleLeave': editing.in = $('#fIn').value; editing.out = $('#fOut').value; editing.leave = !editing.leave; renderSheet(); break;
+    case 'setDayType': {
+      editing.in = $('#fIn').value;
+      editing.out = $('#fOut').value;
+      editing.dayType = editing.dayType === el.dataset.type ? '' : el.dataset.type;
+      renderSheet();
+      break;
+    }
     case 'pick': $('#fFile').click(); break;
     case 'unstage': { const [s] = editing.staged.splice(+el.dataset.k, 1); URL.revokeObjectURL(s.url); editing.in = $('#fIn').value; editing.out = $('#fOut').value; renderSheet(); break; }
     case 'view': openViewer(el.dataset.path); break;
